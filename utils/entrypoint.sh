@@ -14,7 +14,7 @@
 initialize () {
 
     # Check to see if this script has access to all the commands it needs
-    for CMD in cat grep install ln my_print_defaults mysql mysqladmin mysqld_safe mysqlshow sed sleep su tail usermod; do
+    for CMD in cat grep install ln my_print_defaults mysql mysqladmin mysqld_safe mysql_install_db mysqlshow sed sleep su tail usermod; do
       type $CMD &> /dev/null
 
       if [ $? -ne 0 ]; then
@@ -69,7 +69,7 @@ initialize () {
     for FILE in $ZMCONF $ZMPKG $ZMCREATE $PHPINI $HTTPBIN; do 
         if [ -z $FILE ]; then
             echo
-            echo "FATAL: This script was unable to determine one or more cirtical files. Cannot continue."
+            echo "FATAL: This script was unable to determine one or more critical files. Cannot continue."
             echo
             echo "VARIABLE DUMP"
             echo "-------------"
@@ -83,6 +83,25 @@ initialize () {
             exit 98
         fi
     done
+
+    counter=0
+    for CREDENTIAL in $ZM_DB_HOST $ZM_DB_USER $ZM_DB_PASS $ZM_DB_NAME; do
+        if [ -n "$CREDENTIAL" ]; then
+            counter=$((counter+1))
+        fi
+    done
+
+    # counter = 0 means a local database
+    # counter = 4 means a remote database
+    # counter != 0 or 4 means the credentials were not specified correctly and we should fail
+    remoteDB=0
+    if [ $counter -eq "4" ]; then
+        echo " * Remote database credentials detected. Continuing..."
+        remoteDB=1
+    elif [ $counter -ne "0" ]; then
+        echo " * Fatal: Remote database credentials not set correctly."
+        exit 97
+    fi
 }
 
 # Usage: get_mysql_option SECTION VARNAME DEFAULT
@@ -99,7 +118,11 @@ get_mysql_option (){
 
 # Return status of mysql service
 mysql_running () {
-    mysqladmin ping > /dev/null 2>&1
+    if [ $remoteDB -eq "1" ]; then
+        mysqladmin ping -u${ZM_DB_USER} -p${ZM_DB_PASS} -h${ZM_DB_HOST} > /dev/null 2>&1
+    else
+        mysqladmin ping > /dev/null 2>&1
+    fi
     local result="$?"
     if [ "$result" -eq "0" ]; then
         echo "1" # mysql is running
@@ -131,7 +154,11 @@ mysql_datadir_exists() {
 }
 
 zm_db_exists() {
-    mysqlshow zm > /dev/null 2>&1   
+    if [ $remoteDB -eq "1" ]; then
+        mysqlshow -u${ZM_DB_USER} -p${ZM_DB_PASS} -h${ZM_DB_HOST} ${ZM_DB_NAME} > /dev/null 2>&1
+    else
+        mysqlshow zm > /dev/null 2>&1
+    fi
     RETVAL=$?
     if [ "$RETVAL" = "0" ]; then
         echo "1" # ZoneMinder database exists
@@ -157,7 +184,7 @@ start_mysql () {
 
     if [ "$(mysql_datadir_exists)" -eq "0" ]; then
         echo " * First run of MYSQL, initializing DB."
-        mysqld --initialize-insecure
+        mysql_install_db --user=mysql --ldata=/var/lib/mysql/ > /dev/null 2>&1
     elif [ -e ${mypidsocklock} ]; then
         echo " * Removing stale lock file"
         rm -f ${mypidsocklock}
@@ -181,6 +208,37 @@ start_mysql () {
     mysqlpid=`cat "$mypidfile" 2>/dev/null`    
 }
 
+# Check the status of the remote mysql server using supplied credentials
+chk_remote_mysql () {
+    if [ $remoteDB -eq "1" ]; then
+        echo -n " * Looking for remote database server"
+        if [ "$(mysql_running)" -eq "1" ]; then
+            echo "   ...found."
+        else
+            echo "   ...failed!"
+            return
+        fi
+        echo -n " * Looking for existing remote database"
+        if [ "$(zm_db_exists)" -eq "1" ]; then
+            echo "   ...found."
+        else
+            echo "   ...not found."
+            echo -n " * Attempting to create remote database using provided credentials"
+            mysql -u${ZM_DB_USER} -p${ZM_DB_PASS} -h${ZM_DB_HOST} < $ZMCREATE > /dev/null 2>&1
+            RETVAL=$?
+            if [ "$RETVAL" = "0" ]; then
+                echo "   ...done."
+            else
+                echo "   ...failed!"
+                echo " * Error: Remote database must be manually configred."
+            fi
+        fi
+    else
+        # This should never happen
+        echo " * Error: chk_remote_mysql subroutine called but no sql credentials were given!"
+    fi
+}
+
 # Apache service management
 start_http () {
     echo -n " * Starting Apache http web server service"
@@ -188,7 +246,7 @@ start_http () {
     if [ -f /etc/apache2/envvars ]; then
         source /etc/apache2/envvars
     fi
-    $HTTPBIN -k start  > /dev/null 2>&1
+    $HTTPBIN -k start > /dev/null 2>&1
     RETVAL=$?
     if [ "$RETVAL" = "0" ]; then
         echo "   ...done."
@@ -238,22 +296,22 @@ fi
 
 chown -R mysql:mysql /var/lib/mysql/
 # Configure then start Mysql
-if [ -n "$ZM_DB_HOST" ] && [ -n "$ZM_DB_USER" ] && [ -n "$ZM_DB_PASS" ] && [ -n "$ZM_DB_NAME" ]; then
+if [ $remoteDB -eq "1" ]; then
     sed -i -e "s/ZM_DB_NAME=.*$/ZM_DB_NAME=$ZM_DB_NAME/g" $ZMCONF
     sed -i -e "s/ZM_DB_USER=.*$/ZM_DB_USER=$ZM_DB_USER/g" $ZMCONF
     sed -i -e "s/ZM_DB_PASS=.*$/ZM_DB_PASS=$ZM_DB_PASS/g" $ZMCONF
     sed -i -e "s/ZM_DB_HOST=.*$/ZM_DB_HOST=$ZM_DB_HOST/g" $ZMCONF
-    start_mysql
+    chk_remote_mysql
 else
-    usermod -d /var/lib/mysql/ mysql
+    usermod -d /var/lib/mysql/ mysql > /dev/null 2>&1
     start_mysql
+    mysql -u root -e "GRANT ALL PRIVILEGES ON *.* TO 'zmuser'@'localhost' IDENTIFIED BY 'zmpass';"
     if [ "$(zm_db_exists)" -eq "0" ]; then
-        echo " * First run of mysql in the container, creating zoneminder tables."
+        echo " * First run of mysql in the container, creating ZoneMinder dB."
         mysql -u root < $ZMCREATE
     else
         echo " * ZoneMinder dB already exists, skipping table creation."
     fi
-    mysql -u root -e "GRANT ALL PRIVILEGES ON *.* TO 'zmuser'@'localhost' IDENTIFIED BY 'zmpass';"
 fi
 
 # Ensure we shutdown our services cleanly when we are told to stop
